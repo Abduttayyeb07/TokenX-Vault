@@ -55,6 +55,7 @@ const chains: ChainConfig[] = [
 const stats = new Map<string, Stats>();
 const state: State = { cursors: {} };
 const seenAlerts = new Set<string>();
+const backfillBusy = new Set<string>();
 let lastTelegramUpdate = 0;
 
 function key(chain: ChainName, token: TokenName) { return `${chain}:${token}`; }
@@ -135,6 +136,22 @@ async function backfill(runtime: Runtime, token: TokenConfig) {
   while (next <= end) { const to = Math.min(end, next + cfg.maxRange - 1); console.log(`HTTP backfill ${runtime.chain.name} ${token.name} ${next}-${to}; latest=${latest}; backlog=${end - next + 1}`); try { await scanRange(runtime, token, next, to); state.cursors[k] = { lastBlock: to }; await saveState(); } catch { console.error(`HTTP backfill will retry ${runtime.chain.name} ${token.name} from ${next}`); break; } next = to + 1; }
 }
 
+async function runBackfill(runtime: Runtime, token: TokenConfig) {
+  const k = key(runtime.chain.name, token.name);
+  if (backfillBusy.has(k)) {
+    console.warn(`HTTP backfill still running; skipping overlapping cycle for ${k}`);
+    return;
+  }
+  backfillBusy.add(k);
+  try {
+    await backfill(runtime, token);
+  } catch (error) {
+    console.error(`HTTP backfill cycle failed for ${k}: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    backfillBusy.delete(k);
+  }
+}
+
 async function startWs(runtime: Runtime, token: TokenConfig, wsUrlIndex = 0) {
   if (!cfg.useWs || !runtime.chain.ws.length) return;
   const url = runtime.chain.ws[wsUrlIndex % runtime.chain.ws.length]; const stat = stats.get(key(runtime.chain.name, token.name))!;
@@ -157,6 +174,6 @@ async function commands() { if (!cfg.commands || !cfg.telegramToken) return; let
 
 async function verify(chat: string, args: string[]) { const [chainName, tokenName, startText, endText] = args; const chain = chains.find(c => c.name === chainName || c.name.startsWith(chainName)); const token = chain?.tokens.find(t => t.name.toLowerCase() === tokenName?.toLowerCase()); const start = Number(startText); const end = Number(endText ?? start); if (!chain || !token || !Number.isInteger(start) || !Number.isInteger(end) || end < start || end - start > 9) throw new Error("Usage: /verify ethereum|bsc USDT|USDC <block> [toBlock], max 10 blocks"); const runtime = chainRuntime.get(chain.name)!; const rows = await runtime.provider.getLogs({ address: token.address, fromBlock: start, toBlock: end, topics: [TRANSFER_TOPIC] }); const matches = rows.filter(log => { const e = parseLog(log, token); return watched(e.from) || watched(e.to); }); await telegram([chat], `Verification ${chain.display} ${token.name} ${start}-${end}: ${matches.length} matching transfer(s)\n${matches.map(log => { const e = parseLog(log, token); return `${e.formatted} ${token.name} ${watched(e.to) ? "inflow" : "outflow"} ${e.hash}`; }).join("\n") || "No watched-wallet transfer found."}`); }
 
-async function main() { if (!wallets.length) throw new Error("WATCHED_WALLETS is empty"); if (!cfg.telegramToken) console.warn("TELEGRAM_BOT_TOKEN is empty; alerts are disabled"); await loadState(); console.log(`Starting combined Ethereum + BSC USDT/USDC monitor`); console.log(`Wallets: ${wallets.map(w => `${w.label}=${w.address}`).join(", ")}`); for (const chain of chains) { if (!chain.rpc.length) throw new Error(`${chain.name.toUpperCase()}_RPC_URLS is empty`); const connected = await rpcProvider(chain); const runtime: Runtime = { chain, provider: connected.provider, url: connected.url }; chainRuntime.set(chain.name, runtime); for (const token of chain.tokens) { stats.set(key(chain.name, token.name), newStats()); const stat = stats.get(key(chain.name, token.name))!; try { const decimals = await new ethers.Contract(token.address, ERC20_ABI, runtime.provider).decimals(); token.decimals = Number(decimals); } catch { console.warn(`Could not load ${chain.name} ${token.name} decimals; using configured ${token.decimals}`); } void backfill(runtime, token); void startWs(runtime, token); void setInterval(() => { void backfill(runtime, token); }, cfg.pollMs); void setInterval(() => { if (Date.now() - stat.lastDecodedAt > cfg.stallMs && stat.lastHttpBlock > stat.lastWsBlock) { console.warn(`WebSocket appears stalled for ${chain.name} ${token.name}; reconnecting`); void reconnectWs(runtime, token); } }, cfg.stallMs); if (cfg.wsSummary) setInterval(() => console.log(`WebSocket decoded ${stat.decoded} ${chain.name} ${token.name} Transfer event(s); matched watched wallets: ${stat.matched}; last block=${stat.lastWsBlock || "none"}`), cfg.wsSummaryMs); } } if (cfg.health) setInterval(() => { void telegram(cfg.healthIds, healthText()); }, cfg.healthMs); if (cfg.commands) void commands(); await telegram(cfg.chatIds, `Monitor started\nChains: Ethereum + BNB Smart Chain\nTokens: USDT + USDC\nWallets: ${wallets.map(w => w.label).join(", ")}`); }
+async function main() { if (!wallets.length) throw new Error("WATCHED_WALLETS is empty"); if (!cfg.telegramToken) console.warn("TELEGRAM_BOT_TOKEN is empty; alerts are disabled"); await loadState(); console.log(`Starting combined Ethereum + BSC USDT/USDC monitor`); console.log(`Wallets: ${wallets.map(w => `${w.label}=${w.address}`).join(", ")}`); for (const chain of chains) { if (!chain.rpc.length) throw new Error(`${chain.name.toUpperCase()}_RPC_URLS is empty`); const connected = await rpcProvider(chain); const runtime: Runtime = { chain, provider: connected.provider, url: connected.url }; chainRuntime.set(chain.name, runtime); for (const token of chain.tokens) { stats.set(key(chain.name, token.name), newStats()); const stat = stats.get(key(chain.name, token.name))!; try { const decimals = await new ethers.Contract(token.address, ERC20_ABI, runtime.provider).decimals(); token.decimals = Number(decimals); } catch { console.warn(`Could not load ${chain.name} ${token.name} decimals; using configured ${token.decimals}`); } void runBackfill(runtime, token); void startWs(runtime, token); setInterval(() => { void runBackfill(runtime, token); }, cfg.pollMs); setInterval(() => { if (Date.now() - stat.lastDecodedAt > cfg.stallMs && stat.lastHttpBlock > stat.lastWsBlock) { console.warn(`WebSocket appears stalled for ${chain.name} ${token.name}; reconnecting`); void reconnectWs(runtime, token); } }, cfg.stallMs); if (cfg.wsSummary) setInterval(() => console.log(`WebSocket decoded ${stat.decoded} ${chain.name} ${token.name} Transfer event(s); matched watched wallets: ${stat.matched}; last block=${stat.lastWsBlock || "none"}`), cfg.wsSummaryMs); } } if (cfg.health) setInterval(() => { void telegram(cfg.healthIds, healthText()); }, cfg.healthMs); if (cfg.commands) void commands(); await telegram(cfg.chatIds, `Monitor started\nChains: Ethereum + BNB Smart Chain\nTokens: USDT + USDC\nWallets: ${wallets.map(w => w.label).join(", ")}`); }
 
 main().catch(error => { console.error(error); process.exitCode = 1; });
