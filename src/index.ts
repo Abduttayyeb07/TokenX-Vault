@@ -55,6 +55,7 @@ const chains: ChainConfig[] = [
 const stats = new Map<string, Stats>();
 const state: State = { cursors: {} };
 const seenAlerts = new Set<string>();
+const seenWsBillingAlerts = new Set<string>();
 const backfillBusy = new Set<string>();
 let lastTelegramUpdate = 0;
 
@@ -79,6 +80,14 @@ async function telegram(chatIds: string[], text: string) {
       } catch (error) { last = error instanceof Error ? error.message : String(error); if (attempt === cfg.telegramRetries) console.error(`Telegram send failed for ${chatId}: ${last}`); else await new Promise(r => setTimeout(r, attempt * 1000)); }
     }
   }
+}
+
+async function alertWsBillingIssue(chain: ChainConfig, token: TokenConfig, url: string, message: string) {
+  if (!/(quota|payment|billing|subscription|plan|credit|unauthori[sz]ed)/i.test(message)) return;
+  const alertKey = `${chain.name}:${token.name}:${url}:${message}`;
+  if (seenWsBillingAlerts.has(alertKey)) return;
+  seenWsBillingAlerts.add(alertKey);
+  await telegram(cfg.chatIds, `WebSocket provider billing/quota issue\n\nChain: ${chain.display}\nToken: ${token.name}\nEndpoint: ${url}\nMessage: ${message}\n\nTrying fallback WebSocket endpoint.`);
 }
 
 async function rpcProvider(chain: ChainConfig) {
@@ -109,8 +118,31 @@ async function sendTransfer(chain: ChainConfig, token: TokenConfig, log: ethers.
   console.log(`${startup ? "Startup " : ""}${direction} ${event.formatted} ${token.name} for ${wallet.label}: ${event.hash}`); await telegram(cfg.chatIds, text);
 }
 
-type Runtime = { chain: ChainConfig; provider: ethers.JsonRpcProvider; url: string; ws?: ethers.WebSocketProvider; reconnecting?: boolean };
+type Runtime = { chain: ChainConfig; provider: ethers.JsonRpcProvider; url: string; rpcIndex?: number; ws?: ethers.WebSocketProvider; reconnecting?: boolean };
 const chainRuntime = new Map<ChainName, Runtime>();
+
+async function rotateRpc(runtime: Runtime) {
+  if (runtime.chain.rpc.length < 2) return;
+  const start = runtime.rpcIndex ?? Math.max(0, runtime.chain.rpc.indexOf(runtime.url));
+  for (let offset = 1; offset <= runtime.chain.rpc.length; offset++) {
+    const index = (start + offset) % runtime.chain.rpc.length;
+    const url = runtime.chain.rpc[index];
+    try {
+      const request = new ethers.FetchRequest(url);
+      if (url.includes("tatum.io") && cfg.tatumKey) request.setHeader("x-api-key", cfg.tatumKey);
+      const provider = new ethers.JsonRpcProvider(request, runtime.chain.name === "ethereum" ? 1 : 56, { staticNetwork: true, batchMaxCount: 1, pollingInterval: cfg.pollMs });
+      await timeout(provider.getBlockNumber(), cfg.rpcTimeout, `RPC timed out: ${url}`);
+      runtime.provider = provider;
+      runtime.url = url;
+      runtime.rpcIndex = index;
+      console.warn(`Switched ${runtime.chain.display} HTTP RPC to ${url}`);
+      return;
+    } catch (error) {
+      console.error(`RPC failover failed ${runtime.chain.display} ${url}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  console.error(`No alternate usable ${runtime.chain.display} RPC endpoint found; will retry next cycle`);
+}
 
 async function scanRange(runtime: Runtime, token: TokenConfig, from: number, to: number, startup = false) {
   const stat = stats.get(key(runtime.chain.name, token.name))!; if (to < from) return 0;
@@ -147,6 +179,7 @@ async function runBackfill(runtime: Runtime, token: TokenConfig) {
     await backfill(runtime, token);
   } catch (error) {
     console.error(`HTTP backfill cycle failed for ${k}: ${error instanceof Error ? error.message : String(error)}`);
+    await rotateRpc(runtime);
   } finally {
     backfillBusy.delete(k);
   }
@@ -159,12 +192,12 @@ async function startWs(runtime: Runtime, token: TokenConfig, wsUrlIndex = 0) {
     console.log(`Trying WebSocket ${runtime.chain.display}: ${url}`); const ws = new ethers.WebSocketProvider(url, runtime.chain.name === "ethereum" ? 1 : 56); runtime.ws = ws; await timeout(ws.getBlockNumber(), cfg.rpcTimeout, `WebSocket timed out: ${url}`);
     const filter = { address: token.address, topics: [TRANSFER_TOPIC] }; console.log(`Subscribing all ${runtime.chain.display} ${token.name} Transfer events on ${token.address}`);
     ws.on(filter, async (log) => { try { const item = parseLog(log as ethers.Log, token); stat.decoded++; stat.lastDecodedAt = Date.now(); stat.lastWsBlock = Math.max(stat.lastWsBlock, item.block); const wallet = watched(item.from) ?? watched(item.to); if (wallet) { console.log(`WebSocket decoded matching ${runtime.chain.name} ${token.name} tx ${item.hash} block ${item.block} wallet=${wallet.label} direction=${watched(item.to) ? "inflow" : "outflow"}`); await sendTransfer(runtime.chain, token, log as ethers.Log, stat); } } catch (error) { console.error(`WebSocket decode failed ${runtime.chain.name} ${token.name}: ${error instanceof Error ? error.message : String(error)}`); } });
-    runtime.ws.on("error", error => { stat.lastWsError = String(error); console.error(`WebSocket error ${runtime.chain.name}: ${String(error)}`); void reconnectWs(runtime, token); });
+    runtime.ws.on("error", error => { stat.lastWsError = String(error); console.error(`WebSocket error ${runtime.chain.name}: ${String(error)}`); void alertWsBillingIssue(runtime.chain, token, url, stat.lastWsError); void reconnectWs(runtime, token, wsUrlIndex + 1); });
     const rawSocket = (ws as unknown as { websocket?: { on?: (event: string, callback: (...args: unknown[]) => void) => void } }).websocket;
-    rawSocket?.on?.("close", (...args) => { stat.lastWsError = `socket closed ${args.map(String).join(" ")}`; console.error(`WebSocket closed ${runtime.chain.name} ${token.name}; reconnecting`); void reconnectWs(runtime, token); });
+    rawSocket?.on?.("close", (...args) => { stat.lastWsError = `socket closed ${args.map(String).join(" ")}`; console.error(`WebSocket closed ${runtime.chain.name} ${token.name}; reconnecting`); void alertWsBillingIssue(runtime.chain, token, url, stat.lastWsError); void reconnectWs(runtime, token, wsUrlIndex + 1); });
     rawSocket?.on?.("error", (...args) => { stat.lastWsError = args.map(String).join(" "); console.error(`Underlying WebSocket error ${runtime.chain.name} ${token.name}: ${stat.lastWsError}`); });
     console.log(`Subscribed to ${runtime.chain.display} ${token.name} Transfer events over WebSocket: ${url}`);
-  } catch (error) { stat.lastWsError = error instanceof Error ? error.message : String(error); console.error(`WebSocket failed ${runtime.chain.name} ${token.name}: ${stat.lastWsError}`); setTimeout(() => void reconnectWs(runtime, token, wsUrlIndex + 1), 2000); }
+  } catch (error) { stat.lastWsError = error instanceof Error ? error.message : String(error); console.error(`WebSocket failed ${runtime.chain.name} ${token.name}: ${stat.lastWsError}`); void alertWsBillingIssue(runtime.chain, token, url, stat.lastWsError); setTimeout(() => void reconnectWs(runtime, token, wsUrlIndex + 1), 2000); }
 }
 
 async function reconnectWs(runtime: Runtime, token: TokenConfig, next = 0) { if (runtime.reconnecting) return; runtime.reconnecting = true; try { try { await runtime.ws?.destroy(); } catch { /* closed already */ } await new Promise(r => setTimeout(r, 2000)); await startWs(runtime, token, next); } finally { runtime.reconnecting = false; } }
