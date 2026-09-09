@@ -13,6 +13,7 @@ type State = { cursors: Record<string, CursorState> };
 type Stats = { decoded: number; matched: number; scanned: number; alerts: number; lastWsBlock: number; lastHttpBlock: number; startedAt: number; lastDecodedAt: number; lastWsHeartbeatAt: number; lastWsError?: string };
 
 const TRANSFER_TOPIC = ethers.id("Transfer(address,address,uint256)");
+const ETH_USDT_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const ZERO_TOPIC = "0x" + "0".repeat(64);
 const ERC20_ABI = ["function decimals() view returns (uint8)", "function balanceOf(address) view returns (uint256)"];
 const TOKENS: Record<ChainName, TokenConfig[]> = {
@@ -61,7 +62,8 @@ let lastTelegramUpdate = 0;
 
 function key(chain: ChainName, token: TokenName) { return `${chain}:${token}`; }
 function newStats(): Stats { return { decoded: 0, matched: 0, scanned: 0, alerts: 0, lastWsBlock: 0, lastHttpBlock: 0, startedAt: Date.now(), lastDecodedAt: Date.now(), lastWsHeartbeatAt: 0 }; }
-function topicsFor(wallet: string, position: 1 | 2) { const t = wallet.toLowerCase().replace(/^0x/, "").padStart(64, "0"); const topics: (string | null)[] = [TRANSFER_TOPIC, null, null]; topics[position] = `0x${t}`; return topics; }
+function transferTopic(token: TokenConfig) { return token.address.toLowerCase() === TOKENS.ethereum[0].address.toLowerCase() ? ETH_USDT_TRANSFER_TOPIC : TRANSFER_TOPIC; }
+function topicsFor(wallet: string, position: 1 | 2, topic = TRANSFER_TOPIC) { const t = wallet.toLowerCase().replace(/^0x/, "").padStart(64, "0"); const topics: (string | null)[] = [topic, null, null]; topics[position] = `0x${t}`; return topics; }
 function parseLog(log: ethers.Log, token: TokenConfig) { const from = ethers.getAddress(`0x${log.topics[1].slice(-40)}`); const to = ethers.getAddress(`0x${log.topics[2].slice(-40)}`); const amount = BigInt(log.data); return { from, to, amount, formatted: ethers.formatUnits(amount, token.decimals), hash: log.transactionHash, block: log.blockNumber }; }
 function watched(address: string) { return wallets.find(w => w.address.toLowerCase() === address.toLowerCase()); }
 
@@ -150,7 +152,7 @@ async function scanRange(runtime: Runtime, token: TokenConfig, from: number, to:
   const stat = stats.get(key(runtime.chain.name, token.name))!; if (to < from) return 0;
   const filterBase = { address: token.address, fromBlock: from, toBlock: to };
   const logs: ethers.Log[] = []; const seen = new Set<string>();
-  for (const wallet of wallets) for (const topics of [topicsFor(wallet.address, 1), topicsFor(wallet.address, 2)]) {
+  for (const wallet of wallets) for (const topics of [topicsFor(wallet.address, 1, transferTopic(token)), topicsFor(wallet.address, 2, transferTopic(token))]) {
     try {
       const rows = await timeout(runtime.provider.getLogs({ ...filterBase, topics }), cfg.rpcTimeout, `eth_getLogs timed out for ${runtime.chain.name} ${token.name} ${from}-${to}`);
       for (const row of rows) if (!seen.has(row.transactionHash + row.index)) { seen.add(row.transactionHash + row.index); logs.push(row); }
@@ -192,7 +194,7 @@ async function startWs(runtime: Runtime, token: TokenConfig, wsUrlIndex = 0) {
   const url = runtime.chain.ws[wsUrlIndex % runtime.chain.ws.length]; const stat = stats.get(key(runtime.chain.name, token.name))!;
   try {
     console.log(`Trying WebSocket ${runtime.chain.display}: ${url}`); const ws = new ethers.WebSocketProvider(url, runtime.chain.name === "ethereum" ? 1 : 56); runtime.ws = ws; await timeout(ws.getBlockNumber(), cfg.rpcTimeout, `WebSocket timed out: ${url}`);
-const filters = wallets.flatMap(wallet => [topicsFor(wallet.address, 1), topicsFor(wallet.address, 2)]).map(topics => ({ address: token.address, topics })); console.log(`Subscribing watched-wallet ${runtime.chain.display} ${token.name} Transfer events on ${token.address} (${filters.length} filters)`);
+const filters = wallets.flatMap(wallet => [topicsFor(wallet.address, 1, transferTopic(token)), topicsFor(wallet.address, 2, transferTopic(token))]).map(topics => ({ address: token.address, topics })); console.log(`Subscribing watched-wallet ${runtime.chain.display} ${token.name} Transfer events on ${token.address} (${filters.length} filters)`);
     for (const filter of filters) ws.on(filter, async (log) => { try { const item = parseLog(log as ethers.Log, token); stat.decoded++; stat.lastDecodedAt = Date.now(); stat.lastWsBlock = Math.max(stat.lastWsBlock, item.block); const wallet = watched(item.from) ?? watched(item.to); if (wallet) { console.log(`WebSocket decoded matching ${runtime.chain.name} ${token.name} tx ${item.hash} block ${item.block} wallet=${wallet.label} direction=${watched(item.to) ? "inflow" : "outflow"}`); await sendTransfer(runtime.chain, token, log as ethers.Log, stat); } } catch (error) { console.error(`WebSocket decode failed ${runtime.chain.name} ${token.name}: ${error instanceof Error ? error.message : String(error)}`); } });
     runtime.ws.on("error", error => { stat.lastWsError = String(error); console.error(`WebSocket error ${runtime.chain.name}: ${String(error)}`); void alertWsBillingIssue(runtime.chain, token, url, stat.lastWsError); void reconnectWs(runtime, token, wsUrlIndex + 1); });
     const rawSocket = (ws as unknown as { websocket?: { on?: (event: string, callback: (...args: unknown[]) => void) => void } }).websocket;
