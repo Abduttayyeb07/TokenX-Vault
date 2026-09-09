@@ -98,6 +98,7 @@ async function rpcProvider(chain: ChainConfig) {
       if (url.includes("tatum.io") && cfg.tatumKey) request.setHeader("x-api-key", cfg.tatumKey);
       const provider = new ethers.JsonRpcProvider(request, chain.name === "ethereum" ? 1 : 56, { staticNetwork: true, batchMaxCount: 1, pollingInterval: cfg.pollMs });
       await timeout(provider.getBlockNumber(), cfg.rpcTimeout, `RPC timed out: ${url}`);
+      if (wallets[0]) await timeout(provider.getBalance(wallets[0].address), cfg.rpcTimeout, `RPC balance check timed out: ${url}`);
       console.log(`Connected ${chain.display} RPC: ${url}`); return { provider, url };
     } catch (error) { last = error instanceof Error ? error.message : String(error); console.error(`RPC failed ${url}: ${last}`); }
   }
@@ -132,6 +133,7 @@ async function rotateRpc(runtime: Runtime) {
       if (url.includes("tatum.io") && cfg.tatumKey) request.setHeader("x-api-key", cfg.tatumKey);
       const provider = new ethers.JsonRpcProvider(request, runtime.chain.name === "ethereum" ? 1 : 56, { staticNetwork: true, batchMaxCount: 1, pollingInterval: cfg.pollMs });
       await timeout(provider.getBlockNumber(), cfg.rpcTimeout, `RPC timed out: ${url}`);
+      if (wallets[0]) await timeout(provider.getBalance(wallets[0].address), cfg.rpcTimeout, `RPC balance check timed out: ${url}`);
       runtime.provider = provider;
       runtime.url = url;
       runtime.rpcIndex = index;
@@ -190,19 +192,19 @@ async function startWs(runtime: Runtime, token: TokenConfig, wsUrlIndex = 0) {
   const url = runtime.chain.ws[wsUrlIndex % runtime.chain.ws.length]; const stat = stats.get(key(runtime.chain.name, token.name))!;
   try {
     console.log(`Trying WebSocket ${runtime.chain.display}: ${url}`); const ws = new ethers.WebSocketProvider(url, runtime.chain.name === "ethereum" ? 1 : 56); runtime.ws = ws; await timeout(ws.getBlockNumber(), cfg.rpcTimeout, `WebSocket timed out: ${url}`);
-    const filter = { address: token.address, topics: [TRANSFER_TOPIC] }; console.log(`Subscribing all ${runtime.chain.display} ${token.name} Transfer events on ${token.address}`);
+const filter = { address: token.address, topics: [TRANSFER_TOPIC] }; console.log(`Subscribing all ${runtime.chain.display} ${token.name} Transfer events on ${token.address}`);
     ws.on(filter, async (log) => { try { const item = parseLog(log as ethers.Log, token); stat.decoded++; stat.lastDecodedAt = Date.now(); stat.lastWsBlock = Math.max(stat.lastWsBlock, item.block); const wallet = watched(item.from) ?? watched(item.to); if (wallet) { console.log(`WebSocket decoded matching ${runtime.chain.name} ${token.name} tx ${item.hash} block ${item.block} wallet=${wallet.label} direction=${watched(item.to) ? "inflow" : "outflow"}`); await sendTransfer(runtime.chain, token, log as ethers.Log, stat); } } catch (error) { console.error(`WebSocket decode failed ${runtime.chain.name} ${token.name}: ${error instanceof Error ? error.message : String(error)}`); } });
     runtime.ws.on("error", error => { stat.lastWsError = String(error); console.error(`WebSocket error ${runtime.chain.name}: ${String(error)}`); void alertWsBillingIssue(runtime.chain, token, url, stat.lastWsError); void reconnectWs(runtime, token, wsUrlIndex + 1); });
     const rawSocket = (ws as unknown as { websocket?: { on?: (event: string, callback: (...args: unknown[]) => void) => void } }).websocket;
     rawSocket?.on?.("close", (...args) => { stat.lastWsError = `socket closed ${args.map(String).join(" ")}`; console.error(`WebSocket closed ${runtime.chain.name} ${token.name}; reconnecting`); void alertWsBillingIssue(runtime.chain, token, url, stat.lastWsError); void reconnectWs(runtime, token, wsUrlIndex + 1); });
     rawSocket?.on?.("error", (...args) => { stat.lastWsError = args.map(String).join(" "); console.error(`Underlying WebSocket error ${runtime.chain.name} ${token.name}: ${stat.lastWsError}`); });
     console.log(`Subscribed to ${runtime.chain.display} ${token.name} Transfer events over WebSocket: ${url}`);
-    stat.lastWsHeartbeatAt = Date.now();
+    stat.lastWsHeartbeatAt = Date.now(); stat.lastWsError = undefined;
     setInterval(() => { void checkWsHeartbeat(runtime, token, stat); }, cfg.stallMs);
   } catch (error) { stat.lastWsError = error instanceof Error ? error.message : String(error); console.error(`WebSocket failed ${runtime.chain.name} ${token.name}: ${stat.lastWsError}`); void alertWsBillingIssue(runtime.chain, token, url, stat.lastWsError); setTimeout(() => void reconnectWs(runtime, token, wsUrlIndex + 1), 2000); }
 }
 
-async function reconnectWs(runtime: Runtime, token: TokenConfig, next = 0) { const stat = stats.get(key(runtime.chain.name, token.name)); if (stat && Date.now() - stat.lastWsHeartbeatAt < cfg.stallMs * 2) return; if (runtime.reconnecting) return; runtime.reconnecting = true; try { try { await runtime.ws?.destroy(); } catch { /* closed already */ } await new Promise(r => setTimeout(r, 2000)); await startWs(runtime, token, next); } finally { runtime.reconnecting = false; } }
+async function reconnectWs(runtime: Runtime, token: TokenConfig, next = 0) { const stat = stats.get(key(runtime.chain.name, token.name)); if (!stat?.lastWsError) return; if (stat && Date.now() - stat.lastWsHeartbeatAt < cfg.stallMs * 2) return; if (runtime.reconnecting) return; runtime.reconnecting = true; try { try { await runtime.ws?.destroy(); } catch { /* closed already */ } await new Promise(r => setTimeout(r, 2000)); await startWs(runtime, token, next); } finally { runtime.reconnecting = false; } }
 
 async function checkWsHeartbeat(runtime: Runtime, token: TokenConfig, stat: Stats) {
   if (!runtime.ws || runtime.reconnecting) return;
