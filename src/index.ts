@@ -10,7 +10,7 @@ type TokenConfig = { name: TokenName; address: string; decimals: number };
 type ChainConfig = { name: ChainName; display: string; rpc: string[]; ws: string[]; native: string; tokens: TokenConfig[] };
 type CursorState = { lastBlock: number };
 type State = { cursors: Record<string, CursorState> };
-type Stats = { decoded: number; matched: number; scanned: number; alerts: number; lastWsBlock: number; lastHttpBlock: number; startedAt: number; lastDecodedAt: number; lastWsError?: string };
+type Stats = { decoded: number; matched: number; scanned: number; alerts: number; lastWsBlock: number; lastHttpBlock: number; startedAt: number; lastDecodedAt: number; lastWsHeartbeatAt: number; lastWsError?: string };
 
 const TRANSFER_TOPIC = ethers.id("Transfer(address,address,uint256)");
 const ZERO_TOPIC = "0x" + "0".repeat(64);
@@ -60,7 +60,7 @@ const backfillBusy = new Set<string>();
 let lastTelegramUpdate = 0;
 
 function key(chain: ChainName, token: TokenName) { return `${chain}:${token}`; }
-function newStats(): Stats { return { decoded: 0, matched: 0, scanned: 0, alerts: 0, lastWsBlock: 0, lastHttpBlock: 0, startedAt: Date.now(), lastDecodedAt: Date.now() }; }
+function newStats(): Stats { return { decoded: 0, matched: 0, scanned: 0, alerts: 0, lastWsBlock: 0, lastHttpBlock: 0, startedAt: Date.now(), lastDecodedAt: Date.now(), lastWsHeartbeatAt: 0 }; }
 function topicsFor(wallet: string, position: 1 | 2) { const t = wallet.toLowerCase().replace(/^0x/, "").padStart(64, "0"); const topics: (string | null)[] = [TRANSFER_TOPIC, null, null]; topics[position] = `0x${t}`; return topics; }
 function parseLog(log: ethers.Log, token: TokenConfig) { const from = ethers.getAddress(`0x${log.topics[1].slice(-40)}`); const to = ethers.getAddress(`0x${log.topics[2].slice(-40)}`); const amount = BigInt(log.data); return { from, to, amount, formatted: ethers.formatUnits(amount, token.decimals), hash: log.transactionHash, block: log.blockNumber }; }
 function watched(address: string) { return wallets.find(w => w.address.toLowerCase() === address.toLowerCase()); }
@@ -197,10 +197,25 @@ async function startWs(runtime: Runtime, token: TokenConfig, wsUrlIndex = 0) {
     rawSocket?.on?.("close", (...args) => { stat.lastWsError = `socket closed ${args.map(String).join(" ")}`; console.error(`WebSocket closed ${runtime.chain.name} ${token.name}; reconnecting`); void alertWsBillingIssue(runtime.chain, token, url, stat.lastWsError); void reconnectWs(runtime, token, wsUrlIndex + 1); });
     rawSocket?.on?.("error", (...args) => { stat.lastWsError = args.map(String).join(" "); console.error(`Underlying WebSocket error ${runtime.chain.name} ${token.name}: ${stat.lastWsError}`); });
     console.log(`Subscribed to ${runtime.chain.display} ${token.name} Transfer events over WebSocket: ${url}`);
+    stat.lastWsHeartbeatAt = Date.now();
+    setInterval(() => { void checkWsHeartbeat(runtime, token, stat); }, cfg.stallMs);
   } catch (error) { stat.lastWsError = error instanceof Error ? error.message : String(error); console.error(`WebSocket failed ${runtime.chain.name} ${token.name}: ${stat.lastWsError}`); void alertWsBillingIssue(runtime.chain, token, url, stat.lastWsError); setTimeout(() => void reconnectWs(runtime, token, wsUrlIndex + 1), 2000); }
 }
 
-async function reconnectWs(runtime: Runtime, token: TokenConfig, next = 0) { if (runtime.reconnecting) return; runtime.reconnecting = true; try { try { await runtime.ws?.destroy(); } catch { /* closed already */ } await new Promise(r => setTimeout(r, 2000)); await startWs(runtime, token, next); } finally { runtime.reconnecting = false; } }
+async function reconnectWs(runtime: Runtime, token: TokenConfig, next = 0) { const stat = stats.get(key(runtime.chain.name, token.name)); if (stat && Date.now() - stat.lastWsHeartbeatAt < cfg.stallMs * 2) return; if (runtime.reconnecting) return; runtime.reconnecting = true; try { try { await runtime.ws?.destroy(); } catch { /* closed already */ } await new Promise(r => setTimeout(r, 2000)); await startWs(runtime, token, next); } finally { runtime.reconnecting = false; } }
+
+async function checkWsHeartbeat(runtime: Runtime, token: TokenConfig, stat: Stats) {
+  if (!runtime.ws || runtime.reconnecting) return;
+  try {
+    const block = await timeout(runtime.ws.getBlockNumber(), cfg.rpcTimeout, `WebSocket heartbeat timed out: ${runtime.chain.name} ${token.name}`);
+    stat.lastWsHeartbeatAt = Date.now();
+    if (block > stat.lastWsBlock) stat.lastWsBlock = block;
+  } catch (error) {
+    stat.lastWsError = error instanceof Error ? error.message : String(error);
+    console.error(`WebSocket heartbeat failed ${runtime.chain.name} ${token.name}: ${stat.lastWsError}; reconnecting`);
+    void reconnectWs(runtime, token);
+  }
+}
 
 async function balances(runtime: Runtime) { const parts = [`${runtime.chain.display}`]; for (const wallet of wallets) { const nativeBalance = await runtime.provider.getBalance(wallet.address); parts.push(`\n${wallet.label}\n${runtime.chain.native.padEnd(5)} ${ethers.formatEther(nativeBalance)}`); for (const token of runtime.chain.tokens) { const value = await new ethers.Contract(token.address, ERC20_ABI, runtime.provider).balanceOf(wallet.address); parts.push(`${token.name.padEnd(5)} ${ethers.formatUnits(value, token.decimals)}`); } } return parts.join("\n"); }
 
