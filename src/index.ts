@@ -87,7 +87,7 @@ async function alertWsBillingIssue(chain: ChainConfig, token: TokenConfig, url: 
   const alertKey = `${chain.name}:${token.name}:${url}:${message}`;
   if (seenWsBillingAlerts.has(alertKey)) return;
   seenWsBillingAlerts.add(alertKey);
-  await telegram(cfg.chatIds, `WebSocket provider billing/quota issue\n\nChain: ${chain.display}\nToken: ${token.name}\nEndpoint: ${url}\nMessage: ${message}\n\nTrying fallback WebSocket endpoint.`);
+  await telegram(cfg.healthIds, `WebSocket provider billing/quota issue\n\nChain: ${chain.display}\nToken: ${token.name}\nEndpoint: ${url}\nMessage: ${message}\n\nTrying fallback WebSocket endpoint.`);
 }
 
 async function rpcProvider(chain: ChainConfig) {
