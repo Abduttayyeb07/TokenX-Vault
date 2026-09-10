@@ -40,7 +40,7 @@ const cfg = {
   telegramToken: env("TELEGRAM_BOT_TOKEN"), chatIds: split(env("TELEGRAM_CHAT_IDS")), healthIds: split(env("TELEGRAM_HEALTH_CHAT_IDS")), balanceIds: split(env("TELEGRAM_CHAT_IDS")),
   telegramTimeout: intEnv("TELEGRAM_TIMEOUT_MS", 20000), telegramRetries: intEnv("TELEGRAM_RETRIES", 3), commands: boolEnv("TELEGRAM_COMMANDS_ENABLED", true),
   pollMs: intEnv("POLL_INTERVAL_MS", 10000), confirmations: intEnv("CONFIRMATIONS", 1), maxRange: Math.max(1, intEnv("MAX_BLOCK_RANGE", 5)), maxBacklog: Math.max(1, intEnv("MAX_BACKLOG_BLOCKS", 25)),
-  rpcTimeout: intEnv("RPC_TIMEOUT_MS", 20000), rpcDelay: intEnv("RPC_MIN_DELAY_MS", 400), stateFile: env("STATE_FILE", "./data/state.json"),
+  rpcTimeout: intEnv("RPC_TIMEOUT_MS", 20000), rpcDelay: intEnv("RPC_MIN_DELAY_MS", 400), stateFile: env("STATE_FILE", "./data/state.json"), ethBalanceRpc: env("ETH_BALANCE_RPC_URL"),
   minAlert: Number(process.env.MIN_ALERT_AMOUNT ?? 1), useWs: boolEnv("USE_WEBSOCKET", true), startLatest: boolEnv("START_FROM_LATEST_ON_BOOT", true), backfillOverlap: Math.max(0, intEnv("BACKFILL_OVERLAP_BLOCKS", 3)),
   incoming: boolEnv("ALERT_INCOMING", true), outgoing: boolEnv("ALERT_OUTGOING", true), health: boolEnv("TELEGRAM_HEALTH_UPDATE_ENABLED", true),
   healthMs: intEnv("TELEGRAM_HEALTH_UPDATE_INTERVAL_MS", 3600000), balanceTimes: split(env("BALANCE_REPORT_TIMES", "12:00,21:00")), balanceTimezone: env("BALANCE_REPORT_TIMEZONE", "Asia/Karachi"), wsSummary: boolEnv("LOG_WEBSOCKET_DECODED_SUMMARY", true), wsSummaryMs: intEnv("WEBSOCKET_DECODED_SUMMARY_INTERVAL_MS", 30000),
