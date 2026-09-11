@@ -1,0 +1,31 @@
+global
+    log /dev/log local0
+    log /dev/log local1 notice
+    daemon
+
+defaults
+    log global
+    mode http
+    option httplog
+    option forwardfor
+    timeout connect 5s
+    timeout client 30s
+    timeout server 30s
+
+frontend http_in
+    bind *:80
+    http-request redirect scheme https code 301
+
+frontend https_in
+    bind *:443 ssl crt /etc/haproxy/certs/toknexvaults.pem
+    http-request set-header X-Forwarded-Proto https
+
+    acl tokenx_host hdr(host) -i toknexvaults.com www.toknexvaults.com
+    acl api_path path_beg /api/
+    use_backend tokenx_api if tokenx_host api_path
+
+    http-request deny deny_status 404
+
+backend tokenx_api
+    mode http
+    server tokenx_monitor 127.0.0.1:3276 check
