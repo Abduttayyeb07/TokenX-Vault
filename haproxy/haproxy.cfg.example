@@ -17,10 +17,10 @@ frontend http_in
     http-request redirect scheme https code 301
 
 frontend https_in
-    bind *:443 ssl crt /etc/haproxy/certs/toknexvaults.pem
+    bind *:443 ssl crt /etc/haproxy/certs/api.toknexvaults.com.pem
     http-request set-header X-Forwarded-Proto https
 
-    acl tokenx_host hdr(host) -i toknexvaults.com www.toknexvaults.com
+    acl tokenx_host hdr(host) -i api.toknexvaults.com
     acl api_path path_beg /api/
     use_backend tokenx_api if tokenx_host api_path
 
