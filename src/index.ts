@@ -1,5 +1,7 @@
 import "dotenv/config";
 import { ethers } from "ethers";
+import { Pool } from "pg";
+import http from "node:http";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -122,6 +124,12 @@ const cfg = {
   healthMs: intEnv("TELEGRAM_HEALTH_UPDATE_INTERVAL_MS", 3600000),
   balanceTimes: split(env("BALANCE_REPORT_TIMES", "12:00,21:00")),
   balanceTimezone: env("BALANCE_REPORT_TIMEZONE", "Asia/Karachi"),
+  databaseUrl: env("DATABASE_URL", "postgresql://token_monitor:change-me@postgres:5432/token_monitor"),
+  // The process must listen on the container interface; Docker restricts the host binding to localhost.
+  apiHost: env("API_HOST", "0.0.0.0"),
+  apiPort: intEnv("API_PORT", 3276),
+  apiAllowedOrigins: split(env("API_ALLOWED_ORIGINS")),
+  apiAccessToken: env("API_ACCESS_TOKEN"),
   wsSummary: boolEnv("LOG_WEBSOCKET_DECODED_SUMMARY", true),
   wsSummaryMs: intEnv("WEBSOCKET_DECODED_SUMMARY_INTERVAL_MS", 30000),
   tatumKey: env("TATUM_API_KEY"),
@@ -158,6 +166,7 @@ const state: State = { cursors: {} };
 const seenAlerts = new Set<string>();
 const seenWsBillingAlerts = new Set<string>();
 const backfillBusy = new Set<string>();
+let database: Pool | null = null;
 let lastTelegramUpdate = 0;
 
 function key(chain: ChainName, token: TokenName) {
@@ -265,8 +274,140 @@ async function alertWsBillingIssue(
   seenWsBillingAlerts.add(alertKey);
   await telegram(
     cfg.healthIds,
-    `WebSocket provider billing/quota issue\n\nChain: ${chain.display}\nToken: ${token.name}\nEndpoint: ${url}\nMessage: ${message}\n\nTrying fallback WebSocket endpoint.`,
+    `WebSocket subscription/endpoint issue: ${chain.display}\nToken: ${token.name}\nEndpoint: ${url}\nMessage: ${message}\n\nTrying fallback WebSocket endpoint.`,
   );
+}
+
+async function initializeDatabase() {
+  const nextDatabase = new Pool({ connectionString: cfg.databaseUrl, max: 10, idleTimeoutMillis: 30000 });
+  try {
+    await nextDatabase.query(`
+    CREATE TABLE IF NOT EXISTS transactions (
+      id BIGSERIAL PRIMARY KEY,
+      chain TEXT NOT NULL,
+      token TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      wallet_label TEXT NOT NULL,
+      wallet_address TEXT NOT NULL,
+      amount NUMERIC(78, 18) NOT NULL,
+      from_address TEXT NOT NULL,
+      tx_from TEXT NOT NULL,
+      to_address TEXT NOT NULL,
+      transaction_hash TEXT NOT NULL,
+      log_index INTEGER NOT NULL,
+      block_number BIGINT NOT NULL,
+      block_timestamp TIMESTAMPTZ,
+      detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      alert_sent BOOLEAN NOT NULL DEFAULT FALSE,
+      UNIQUE(chain, token, transaction_hash, log_index)
+    );
+    CREATE INDEX IF NOT EXISTS idx_transactions_block_timestamp ON transactions(block_timestamp DESC);
+    CREATE INDEX IF NOT EXISTS idx_transactions_wallet ON transactions(wallet_address);
+    CREATE INDEX IF NOT EXISTS idx_transactions_chain_token ON transactions(chain, token);
+    `);
+    database = nextDatabase;
+    console.log("Connected to PostgreSQL and verified transactions table");
+  } catch (error) {
+    await nextDatabase.end().catch(() => undefined);
+    database = null;
+    throw error;
+  }
+}
+
+async function saveTransaction(input: { chain: ChainConfig; token: TokenConfig; direction: string; wallet: Wallet; amount: string; from: string; txFrom: string; to: string; hash: string; logIndex: number; block: number; blockTimestamp: number | null }) {
+  const activeDatabase = database;
+  if (!activeDatabase) throw new Error("PostgreSQL is unavailable");
+  try {
+    const result = await activeDatabase.query(`
+    INSERT INTO transactions (chain, token, direction, wallet_label, wallet_address, amount, from_address, tx_from, to_address, transaction_hash, log_index, block_number, block_timestamp, alert_sent)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, CASE WHEN $13::bigint IS NULL THEN NULL ELSE to_timestamp($13::bigint) END, TRUE)
+    ON CONFLICT (chain, token, transaction_hash, log_index) DO NOTHING
+    RETURNING id
+    `, [input.chain.name, input.token.name, input.direction, input.wallet.label, input.wallet.address, input.amount, input.from, input.txFrom, input.to, input.hash, input.logIndex, input.block, input.blockTimestamp]);
+    return result.rowCount === 1;
+  } catch (error) {
+    database = null;
+    await activeDatabase.end().catch(() => undefined);
+    throw error;
+  }
+}
+
+function apiJson(response: http.ServerResponse, status: number, body: unknown) {
+  response.statusCode = status;
+  response.setHeader("content-type", "application/json; charset=utf-8");
+  response.end(JSON.stringify(body));
+}
+
+function startApiServer() {
+  const server = http.createServer(async (request, response) => {
+    const origin = request.headers.origin;
+    if (origin && cfg.apiAllowedOrigins.includes(origin)) {
+      response.setHeader("access-control-allow-origin", origin);
+      response.setHeader("vary", "Origin");
+    }
+    if (request.method === "OPTIONS") {
+      response.setHeader("access-control-allow-methods", "GET, OPTIONS");
+      response.setHeader("access-control-allow-headers", "Authorization, Content-Type");
+      response.statusCode = origin && !cfg.apiAllowedOrigins.includes(origin) ? 403 : 204;
+      response.end();
+      return;
+    }
+    if (origin && !cfg.apiAllowedOrigins.includes(origin)) {
+      apiJson(response, 403, { error: "Origin is not allowed" });
+      return;
+    }
+    const authorization = request.headers.authorization ?? "";
+    if (authorization !== `Bearer ${cfg.apiAccessToken}`) {
+      apiJson(response, 401, { error: "Authorization required" });
+      return;
+    }
+    if (request.method !== "GET") {
+      apiJson(response, 405, { error: "Method not allowed" });
+      return;
+    }
+    const parsed = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
+    if (!database && parsed.pathname.startsWith("/api/transactions")) {
+      apiJson(response, 503, { error: "Database temporarily unavailable" });
+      return;
+    }
+    const activeDatabase = database;
+    try {
+      if (parsed.pathname === "/api/health") {
+        apiJson(response, 200, { ok: true, service: "token-monitor", time: new Date().toISOString() });
+        return;
+      }
+      if (parsed.pathname === "/api/transactions") {
+        const limit = Math.min(500, Math.max(1, Number(parsed.searchParams.get("limit") ?? 50)));
+        const offset = Math.max(0, Number(parsed.searchParams.get("offset") ?? 0));
+        const filters: string[] = [];
+        const values: unknown[] = [];
+        for (const field of ["chain", "token", "direction", "wallet_address", "transaction_hash"]) {
+          const value = parsed.searchParams.get(field);
+          if (value) { filters.push(`${field} = $${values.length + 1}`); values.push(value); }
+        }
+        const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+        const rows = (await activeDatabase!.query(`SELECT * FROM transactions ${where} ORDER BY COALESCE(block_timestamp, detected_at) DESC, id DESC LIMIT $${values.length + 1} OFFSET $${values.length + 2}`, [...values, limit, offset])).rows;
+        const total = (await activeDatabase!.query(`SELECT COUNT(*)::int AS count FROM transactions ${where}`, values)).rows[0] as { count: number };
+        apiJson(response, 200, { data: rows, pagination: { limit, offset, total: total.count } });
+        return;
+      }
+      const transactionMatch = parsed.pathname.match(/^\/api\/transactions\/([^/]+)$/);
+      if (transactionMatch) {
+        const hash = decodeURIComponent(transactionMatch[1]);
+        const rows = (await activeDatabase!.query("SELECT * FROM transactions WHERE transaction_hash = $1 ORDER BY log_index ASC", [hash])).rows;
+        apiJson(response, rows.length ? 200 : 404, rows.length ? { data: rows } : { error: "Transaction not found" });
+        return;
+      }
+      apiJson(response, 404, { error: "Not found" });
+    } catch (error) {
+      console.error(`API request failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+      apiJson(response, 500, { error: "Internal server error" });
+    }
+  });
+  server.listen(cfg.apiPort, cfg.apiHost, () => {
+    console.log(`Transaction API listening on http://${cfg.apiHost}:${cfg.apiPort}`);
+    console.log(`API allowed origins: ${cfg.apiAllowedOrigins.join(", ") || "none configured"}`);
+  });
 }
 
 async function rpcProvider(chain: ChainConfig) {
@@ -326,15 +467,37 @@ async function sendTransfer(
   stat.matched++;
   stat.alerts++;
   let txFrom = event.from;
+  let blockTimestamp: number | null = null;
   try {
-    const tx = await chainRuntime
-      .get(chain.name)
-      ?.provider.getTransaction(event.hash);
+    const provider = chainRuntime.get(chain.name)?.provider;
+    const tx = await provider?.getTransaction(event.hash);
     if (tx?.from) txFrom = tx.from;
+    const block = await provider?.getBlock(event.block);
+    if (block) blockTimestamp = block.timestamp;
   } catch {
-    /* event sender is sufficient */
+    /* event sender and detected time remain available if metadata lookup fails */
   }
   const direction = incoming ? "Inflow" : "Outflow";
+  let inserted = true;
+  try {
+    inserted = await saveTransaction({
+      chain,
+      token,
+      direction,
+      wallet,
+      amount: event.formatted,
+      from: event.from,
+      txFrom,
+      to: event.to,
+      hash: event.hash,
+      logIndex: log.index,
+      block: event.block,
+      blockTimestamp,
+    });
+  } catch (error) {
+    console.error(`Transaction database insert failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!inserted) return;
   const text = `${chain.display} ${token.name} ${direction}\n\nWallet: ${wallet.label}\nAmount: ${event.formatted} ${token.name}\nFrom: ${event.from}\nTx From: ${txFrom}\nTo: ${event.to}\nTx: ${event.hash}\nBlock: ${event.block}\nOpen: ${chain.name === "ethereum" ? "https://etherscan.io/tx/" : "https://bscscan.com/tx/"}${event.hash}`;
   console.log(
     `${startup ? "Startup " : ""}${direction} ${event.formatted} ${token.name} for ${wallet.label}: ${event.hash}`,
@@ -899,8 +1062,20 @@ async function verify(chat: string, args: string[]) {
 
 async function main() {
   if (!wallets.length) throw new Error("WATCHED_WALLETS is empty");
+  if (!cfg.apiAccessToken) throw new Error("API_ACCESS_TOKEN is required");
   if (!cfg.telegramToken)
     console.warn("TELEGRAM_BOT_TOKEN is empty; alerts are disabled");
+  try {
+    await initializeDatabase();
+  } catch (error) {
+    console.error(`PostgreSQL unavailable; monitor will continue without database persistence: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  startApiServer();
+  setInterval(() => {
+    if (!database) {
+      void initializeDatabase().catch((error) => console.error(`PostgreSQL reconnect failed: ${error instanceof Error ? error.message : String(error)}`));
+    }
+  }, 30000);
   await loadState();
   console.log(`Starting combined Ethereum + BSC USDT/USDC monitor`);
   console.log(
